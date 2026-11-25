@@ -33,6 +33,17 @@ def _悬挂户(conn, 日: str) -> list[str]:
     ]
 
 
+def _有效镜(conn, 日: str) -> list[dict]:
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT 账户键, 余额, 抽取批次编号 FROM 周期快照 "
+            "WHERE 营业日=? AND 状态='有效' ORDER BY 账户键",
+            (日,),
+        )
+    ]
+
+
 def _落失败批(conn, 批: str, 日: str, 原因: str, 报告: dict) -> None:
     conn.execute(
         "INSERT INTO 抽取批次(编号, 营业日, 时刻, 报告, 状态, 失败原因) "
@@ -44,18 +55,18 @@ def _落失败批(conn, 批: str, 日: str, 原因: str, 报告: dict) -> None:
 def 日终抽取(营业日: str, 批次编号: str = "") -> dict[str, Any]:
     """按营业日为全部正常账户写周期快照。余额=前日快照(或开户零)+当日流水净额。
 
-    补偿悬挂口径：任一户写入抛错时本批已写户全部转为「悬挂」（状态≠有效，
-    挂失败批号），失败批落库可查；悬挂未补偿前同营业日禁止再抽取、禁止回放。
+    命运前置拒绝口径：首次抽取的成败与命运行同票写库（营业日/批号/成败/有效镜
+    指纹）；同日再抽先消化命运账——缺命运但已有有效镜、或有效命运=失败，一律
+    整票拒绝且有效镜不动。补偿悬挂口径：任一户写入抛错时本批已写户全部转「悬挂」，
+    失败批与失败命运同票落库。
     """
     from app.modules import 抽取命运账 as _fate
-    if not _fate.同日允许再抽(None, 营业日):
-        pass
     日 = 标准化营业日(营业日)
     批 = 批次编号.strip() or f"抽取-{日}-{uuid.uuid4().hex[:8]}"
     conn = 连接()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        
+
         在途 = _取闸(conn, 日)
         if 在途:
             raise 抽取冲突(f"营业日 {日} 已有在途抽取批次 {在途['批次编号']}，拒绝并发抽取")
@@ -65,6 +76,12 @@ def 日终抽取(营业日: str, 批次编号: str = "") -> dict[str, Any]:
                 f"营业日 {日} 存在未补偿悬挂镜（{len(悬挂)} 户：{','.join(悬挂)}），"
                 "须先补偿回滚再抽取"
             )
+        # 命运前置：缺命运却有有效镜、或命运=失败 → 整票拒绝，有效镜不得动
+        判定 = _fate.判再抽(conn, 日)
+        if not 判定["允许"]:
+            raise 抽取冲突(判定["原因"])
+        命运 = 判定["命运"]
+        性质 = "重抽" if (命运 and 命运["命运码"] == "成功") else "首抽"
         conn.execute(
             "INSERT INTO 抽取闸(营业日, 批次编号, 时刻) VALUES (?,?,?)",
             (日, 批, 此刻()),
@@ -219,6 +236,16 @@ def 日终抽取(营业日: str, 批次编号: str = "") -> dict[str, Any]:
                 }
                 _落失败批(conn, 批, 日, 原因, 报告)
                 conn.execute("DELETE FROM 抽取闸 WHERE 营业日=? AND 批次编号=?", (日, 批))
+                # 失败命运与失败批同票落库：失败批命运在册时同日再抽必拒。
+                _fate.登记命运(
+                    conn,
+                    营业日=日,
+                    批号=批,
+                    命运码="失败",
+                    指纹=_fate.计算指纹(_有效镜(conn, 日), 批),
+                    性质=性质,
+                    载荷={"失败原因": 原因, "悬挂数": len(悬挂户)},
+                )
                 conn.commit()
                 raise 半截抽取失败(报告) from 写败
             报告 = {
@@ -237,8 +264,19 @@ def 日终抽取(营业日: str, 批次编号: str = "") -> dict[str, Any]:
                 (批, 日, 此刻(), json.dumps(报告, ensure_ascii=False)),
             )
             conn.execute("DELETE FROM 抽取闸 WHERE 营业日=? AND 批次编号=?", (日, 批))
+            # 成功回执与命运行同票：营业日/批号/成败/有效镜指纹，绝不空号。
+            有效镜 = _有效镜(conn, 日)
+            命运 = _fate.登记命运(
+                conn,
+                营业日=日,
+                批号=批,
+                命运码="成功",
+                指纹=_fate.计算指纹(有效镜, 批),
+                性质=性质,
+                载荷={"有效镜数": len(有效镜)},
+            )
             conn.commit()
-            return {"批次编号": 批, **报告}
+            return {"批次编号": 批, **报告, "命运": 命运}
         except 抽取冲突:
             conn.rollback()
             raise
@@ -255,7 +293,10 @@ def 补偿悬挂(营业日: str, 批次编号: str = "") -> dict[str, Any]:
     """对失败批的悬挂镜执行整票清理：悬挂镜一律撤销，恢复失败前口径。
 
     补偿成功后悬挂清除、核证 valid 翻真，营业日回放才允许执行；之后可重抽。
+    补偿票与命运补登同票：该日有效命运重钉为「已补偿」，抹平失败命运，
+    使其后同日再抽被判为可重新首抽，而非误读旧成功命运。
     """
+    from app.modules import 抽取命运账 as _fate
     日 = 标准化营业日(营业日)
     批 = 批次编号.strip() or f"补偿-{日}-{uuid.uuid4().hex[:8]}"
     conn = 连接()
@@ -272,10 +313,10 @@ def 补偿悬挂(营业日: str, 批次编号: str = "") -> dict[str, Any]:
             raise 补偿无待办(f"营业日 {日} 无待补偿悬挂镜")
         for h in 待:
             if h["是否新插"]:
-                
+
                 conn.execute("DELETE FROM 周期快照 WHERE 快照键=?", (h["快照键"],))
             else:
-                
+
                 conn.execute(
                     "UPDATE 周期快照 SET 状态='有效', 余额=?, 抽取批次编号=? WHERE 快照键=?",
                     (h["旧余额"], h["旧抽取批次编号"], h["快照键"]),
@@ -294,8 +335,17 @@ def 补偿悬挂(营业日: str, 批次编号: str = "") -> dict[str, Any]:
             "INSERT INTO 抽取批次(编号, 营业日, 时刻, 报告, 状态) VALUES (?,?,?,?,'已补偿')",
             (批, 日, 此刻(), json.dumps(报告, ensure_ascii=False)),
         )
+        命运 = _fate.登记命运(
+            conn,
+            营业日=日,
+            批号=批,
+            命运码="已补偿",
+            指纹=_fate.计算指纹(_有效镜(conn, 日), 批),
+            性质="补偿",
+            载荷={"清除悬挂": len(待)},
+        )
         conn.commit()
-        return 报告
+        return {**报告, "命运": 命运}
     except 补偿无待办:
         conn.rollback()
         raise
@@ -306,8 +356,58 @@ def 补偿悬挂(营业日: str, 批次编号: str = "") -> dict[str, Any]:
         conn.close()
 
 
+def 补登命运(营业日: str, 批次编号: str = "") -> dict[str, Any]:
+    """命运补登（修复路径）：为「有效镜在、命运空号」的营业日重钉成功命运。
+
+    失败闭口径：存在在途抽取批、待补偿悬挂镜、或已有有效命运时一律拒绝，
+    绝不与抽写交错插入命运行；补登按当日有效镜现算指纹并与抽取侧同票写库。
+    """
+    from app.modules import 抽取命运账 as _fate
+    日 = 标准化营业日(营业日)
+    conn = 连接()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        在途 = _取闸(conn, 日)
+        if 在途:
+            raise 抽取冲突(
+                f"营业日 {日} 抽取批次 {在途['批次编号']} 在途，命运补登失败闭"
+            )
+        悬挂 = _悬挂户(conn, 日)
+        if 悬挂:
+            raise 抽取冲突(
+                f"营业日 {日} 存在未补偿悬挂镜（{len(悬挂)} 户），命运补登失败闭"
+            )
+        if _fate.取有效命运(conn, 日) is not None:
+            raise 抽取冲突(f"营业日 {日} 已有有效命运，拒绝重复补登")
+        镜 = _有效镜(conn, 日)
+        if not 镜:
+            raise ValueError(f"营业日 {日} 无有效镜可补登命运")
+        批 = 批次编号.strip() or f"补登-{日}-{uuid.uuid4().hex[:8]}"
+        源批 = 镜[0]["抽取批次编号"] or 批
+        命运 = _fate.登记命运(
+            conn,
+            营业日=日,
+            批号=源批,
+            命运码="成功",
+            指纹=_fate.计算指纹(镜, 源批),
+            性质="补登",
+            载荷={"补登批次": 批, "有效镜数": len(镜)},
+        )
+        conn.commit()
+        return {"营业日": 日, "补登批次编号": 批, "有效镜数": len(镜), "命运": 命运}
+    except (抽取冲突, ValueError):
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def 核证(营业日: str, 批次编号: str = "") -> dict[str, Any]:
-    """失败/悬挂核证：批号、残留或悬挂户、可否回放、valid。"""
+    """失败/悬挂核证：批号、残留或悬挂户、命运账、可否回放、valid。"""
+    from app.modules import 抽取命运账 as _fate
     日 = 标准化营业日(营业日)
     conn = 连接()
     try:
@@ -346,10 +446,33 @@ def 核证(营业日: str, 批次编号: str = "") -> dict[str, Any]:
             )
         ]
         悬挂户 = [h["账户键"] for h in 待悬挂]
-        
-        可否回放 = 在途 is None and not 待悬挂
-        
+
+        命运 = _fate.取有效命运(conn, 日)
+        镜 = _有效镜(conn, 日)
+        指纹相符 = bool(
+            命运
+            and 命运["命运码"] == "成功"
+            and _fate.计算指纹(镜, 命运["批号"]) == (命运.get("指纹") or "")
+        )
+        # 回放放行条件：无在途、无待补偿悬挂，且命运账可消化——
+        # 有有效镜却命运空号 → 拒绝（禁成功回执命运空号）；
+        # 命运=失败 → 拒绝；命运=成功 → 指纹必须与当前有效镜相符。
+        命运闸 = True
+        命运拒因 = ""
+        if 在途 is None and not 待悬挂:
+            if 命运 is None:
+                if 镜:
+                    命运闸 = False
+                    命运拒因 = "该日有有效镜但抽取命运空号，禁止按可抽放行回放"
+            elif 命运["命运码"] == "失败":
+                命运闸 = False
+                命运拒因 = f"该日有效命运=失败（批 {命运['批号']}），禁止回放"
+            elif 命运["命运码"] == "成功" and 镜 and not 指纹相符:
+                命运闸 = False
+                命运拒因 = "有效镜指纹与成功命运不符，禁止回放（有效镜疑似被改写）"
+
         valid = 在途 is None and not 待悬挂
+        可否回放 = valid and 命运闸
         return {
             "营业日": 日,
             "口径": "补偿悬挂",
@@ -364,6 +487,10 @@ def 核证(营业日: str, 批次编号: str = "") -> dict[str, Any]:
             ] if 批次编号.strip() else [],
             "本批残留有效镜": 本批有效镜,
             "有效镜户": 有效镜户,
+            "命运": 命运,
+            "命运有效": 命运 is not None,
+            "命运指纹相符": 指纹相符,
+            "命运拒因": 命运拒因,
             "可否回放": 可否回放,
             "valid": valid,
         }

@@ -8,16 +8,19 @@ export default function 日终抽取() {
   const [证, set证] = useState(null);
   const [讯, set讯] = useState("");
   const [注入扫描序, set注入扫描序] = useState(3);
+  const [命运, set命运] = useState(null);
 
   const 刷新 = () =>
     Promise.all([
       api.抽取批次(),
       api.悬挂镜("?处置=待补偿"),
       api.核证(`?营业日=${encodeURIComponent(日)}`),
-    ]).then(([批次行, 悬挂行, 证行]) => {
+      api.抽取命运(`?营业日=${encodeURIComponent(日)}`),
+    ]).then(([批次行, 悬挂行, 证行, 命行]) => {
       set批(批次行);
       set悬挂(悬挂行);
       set证(证行);
+      set命运(命行);
     });
 
   useEffect(() => {
@@ -47,9 +50,13 @@ export default function 日终抽取() {
           onClick={() =>
             api
               .抽取(日)
-              .then((r) =>
-                set讯(`批次 ${r.批次编号} 成功 写入=${r.写入} 盖写=${r.盖写} 断档=${r.断档}`)
-              )
+              .then((r) => {
+                const 命 = r.命运;
+                set讯(
+                  `批次 ${r.批次编号} 成功 写入=${r.写入} 盖写=${r.盖写} 断档=${r.断档}` +
+                    (命 ? ` 命运=${命.命运码} 指纹=${命.指纹}` : " 命运空号！")
+                );
+              })
               .then(刷新)
               .catch((e) => {
                 set讯(显错(e));
@@ -70,6 +77,18 @@ export default function 日终抽取() {
           }
         >
           补偿回滚悬挂
+        </button>
+        <button
+          className="次"
+          onClick={() =>
+            api
+              .命运补登(日)
+              .then((r) => set讯(`命运补登 ${r.补登批次编号} 有效镜=${r.有效镜数} 指纹=${r.命运.指纹}`))
+              .then(刷新)
+              .catch((e) => set讯(String(e.message || e)))
+          }
+        >
+          命运补登
         </button>
         <button className="次" onClick={() => 刷新().catch((e) => set讯(String(e.message || e)))}>
           刷新
@@ -131,6 +150,24 @@ export default function 日终抽取() {
                 <td>{证.悬挂户.length ? 证.悬挂户.join("、") : "无"}</td>
               </tr>
               <tr>
+                <th>有效命运</th>
+                <td>
+                  {证.命运 ? `${证.命运.命运码} · ${证.命运.批号}` : "无（命运空号）"}
+                </td>
+                <th>命运指纹相符</th>
+                <td>
+                  <span className={`徽章 ${证.命运指纹相符 ? "通" : "败"}`}>
+                    {String(证.命运指纹相符)}
+                  </span>
+                </td>
+              </tr>
+              {证.命运拒因 ? (
+                <tr>
+                  <th>命运闸拦截</th>
+                  <td colSpan={3}>{证.命运拒因}</td>
+                </tr>
+              ) : null}
+              <tr>
                 <th>失败批次</th>
                 <td colSpan={3}>
                   {证.失败批次.length
@@ -142,6 +179,40 @@ export default function 日终抽取() {
               </tr>
             </tbody>
           </table>
+        </div>
+      ) : null}
+
+      {命运 ? (
+        <div className="段">
+          <h2 className="段题">抽取命运账 · {命运.营业日 || "（全量）"}（valid={String(命运.valid)}）</h2>
+          {!命运.行.length ? (
+            <div className="空态">该营业日无命运行（同日再抽将被整票拒绝）</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>批号</th>
+                  <th>命运</th>
+                  <th>性质</th>
+                  <th>指纹</th>
+                  <th>有效</th>
+                </tr>
+              </thead>
+              <tbody>
+                {命运.行.map((r) => (
+                  <tr key={`${r.营业日}-${r.批号}`}>
+                    <td>{r.批号}</td>
+                    <td>
+                      <span className={`徽章 ${r.命运 === "成功" ? "通" : "败"}`}>{r.命运}</span>
+                    </td>
+                    <td>{r.性质}</td>
+                    <td>{r.指纹}</td>
+                    <td>{r.有效 ? "当前" : "历史"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       ) : null}
 

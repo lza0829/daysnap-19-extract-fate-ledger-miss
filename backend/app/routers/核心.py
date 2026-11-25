@@ -265,6 +265,16 @@ def 执行补偿(体: 营业日请求):
         raise HTTPException(400, str(e)) from e
 
 
+@路由.post("/命运补登")
+def 执行命运补登(体: 营业日请求):
+    try:
+        return 抽取.补登命运(体.营业日, 体.批次编号)
+    except 抽取冲突 as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
 @路由.post("/回放")
 def 执行回放(体: 营业日请求):
     try:
@@ -309,6 +319,7 @@ def 重置():
             "装载批次",
             "悬挂镜",
             "抽取闸",
+            "抽取命运账表",
         ):
             conn.execute(f"DELETE FROM {t}")
         conn.execute(
@@ -320,21 +331,33 @@ def 重置():
     finally:
         conn.close()
 
-from app.modules import 抽取命运账 as _bf_mod_19
+from app.modules import 抽取命运账 as _命运账
 
 
 @路由.get("/核证/抽取命运")
-def 取核证_19(键: str | None = None):
+def 取核证_抽取命运(营业日: str = "", 批号: str = ""):
+    """命运账核证（只读）：按营业日/批号输出日、批号、命运、valid。
+
+    valid 口径：该日唯一有效命运=成功、且有效镜指纹相符。
+    """
     conn = 连接()
     try:
-        return _bf_mod_19.查现场(conn, 键)
+        现 = _命运账.查现场(conn, 营业日)
+        if 批号.strip():
+            for r in 现["行"]:
+                if r["批号"] == 批号.strip():
+                    现["指定批"] = r
+                    break
+            else:
+                现["指定批"] = None
+        return 现
     finally:
         conn.close()
 
 
 @路由.post("/核证/抽取命运/巡检")
-def 巡检核证_19(payload: dict | None = None):
-    return _bf_mod_19.巡检包(payload or {})
+def 巡检核证_抽取命运(payload: dict | None = None):
+    return _命运账.巡检包(payload or {})
 
 def _alias_payload_19(payload: dict) -> dict:
     out = dict(payload or {})

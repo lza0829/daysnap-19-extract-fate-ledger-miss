@@ -3,11 +3,19 @@ from datetime import datetime, timezone
 from app.db import 连接
 
 建表 = """
+-- 抽取命运账：首次抽取落成必须同票写下本行（营业日、批号、成败、有效镜指纹）。
+-- 有效=1 的行是该营业日当前生效命运；历史行保留审计但置 0。
 CREATE TABLE IF NOT EXISTS 抽取命运账表 (
   编号 INTEGER PRIMARY KEY AUTOINCREMENT,
-  营业日 TEXT, 批号 TEXT, 命运码 TEXT, 指纹 TEXT, 时刻 TEXT,
+  营业日 TEXT NOT NULL,
+  批号 TEXT NOT NULL,
+  命运码 TEXT NOT NULL,
+  指纹 TEXT NOT NULL DEFAULT '',
+  性质 TEXT NOT NULL DEFAULT '首抽',
+  有效 INTEGER NOT NULL DEFAULT 1,
   时刻 TEXT NOT NULL DEFAULT '',
-  载荷 TEXT NOT NULL DEFAULT '{}'
+  载荷 TEXT NOT NULL DEFAULT '{}',
+  UNIQUE(营业日, 批号)
 );
 
 CREATE TABLE IF NOT EXISTS 台参 (
@@ -164,6 +172,26 @@ def _迁移(conn) -> None:
         conn.execute("ALTER TABLE 悬挂镜 ADD COLUMN 旧余额 INTEGER")
         conn.execute(
             "ALTER TABLE 悬挂镜 ADD COLUMN 旧抽取批次编号 TEXT NOT NULL DEFAULT ''"
+        )
+    命运列 = {r["name"] for r in conn.execute("PRAGMA table_info(抽取命运账表)")}
+    if 命运列:
+        for 名, 定义 in (
+            ("性质", "TEXT NOT NULL DEFAULT '首抽'"),
+            ("有效", "INTEGER NOT NULL DEFAULT 1"),
+            ("指纹", "TEXT NOT NULL DEFAULT ''"),
+            ("时刻", "TEXT NOT NULL DEFAULT ''"),
+            ("载荷", "TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            if 名 not in 命运列:
+                conn.execute(f"ALTER TABLE 抽取命运账表 ADD COLUMN {名} {定义}")
+        # 旧库可能残留同日多条“有效”命运：仅保留编号最大者为有效，再建唯一索引。
+        conn.execute(
+            "UPDATE 抽取命运账表 SET 有效=0 WHERE 有效=1 AND 编号 NOT IN "
+            "(SELECT MAX(编号) FROM 抽取命运账表 WHERE 有效=1 GROUP BY 营业日)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS 抽取命运账表_当日唯一有效 "
+            "ON 抽取命运账表(营业日) WHERE 有效=1"
         )
 
 
